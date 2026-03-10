@@ -2,7 +2,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
 import os
-import json
 import asyncpg
 
 # ─────────────────────────────────────────────
@@ -38,68 +37,70 @@ async def init_db(app):
     pool = app.bot_data["db"]
     async with pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS wishlists (
-                user_id BIGINT,
-                url TEXT,
-                name TEXT,
-                display TEXT,
-                photo_url TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                PRIMARY KEY (user_id, url)
-            )
-        """)
-        await conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog (
-                url TEXT PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
+                url TEXT UNIQUE,
                 name TEXT,
                 display TEXT,
                 photo_url TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS wishlists (
+                user_id BIGINT,
+                catalog_id INTEGER REFERENCES catalog(id),
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, catalog_id)
             )
         """)
 
 async def close_db(app):
     await app.bot_data["db"].close()
 
+async def db_save_catalog_item(pool, url, name, display, photo_url):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO catalog (url, name, display, photo_url)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (url) DO UPDATE SET name=$2, display=$3, photo_url=$4
+            RETURNING id
+        """, url, name, display or name, photo_url)
+    return row["id"]
+
+async def db_get_catalog_item_by_id(pool, item_id):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM catalog WHERE id = $1", item_id)
+    return dict(row) if row else {}
+
 async def db_get_wishlist(pool, user_id):
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT url, name, display, photo_url FROM wishlists WHERE user_id = $1 ORDER BY created_at",
-            user_id
-        )
+        rows = await conn.fetch("""
+            SELECT c.id, c.url, c.name, c.display, c.photo_url
+            FROM wishlists w
+            JOIN catalog c ON w.catalog_id = c.id
+            WHERE w.user_id = $1
+            ORDER BY w.created_at
+        """, user_id)
     return [dict(r) for r in rows]
 
-async def db_add_to_wishlist(pool, user_id, url, name, display, photo_url):
+async def db_add_to_wishlist(pool, user_id, catalog_id):
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO wishlists (user_id, url, name, display, photo_url)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (user_id, url) DO NOTHING
-        """, user_id, url, name, display, photo_url)
+            INSERT INTO wishlists (user_id, catalog_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """, user_id, catalog_id)
 
-async def db_remove_from_wishlist(pool, user_id, url):
+async def db_remove_from_wishlist(pool, user_id, catalog_id):
     async with pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM wishlists WHERE user_id = $1 AND url = $2",
-            user_id, url
+            "DELETE FROM wishlists WHERE user_id = $1 AND catalog_id = $2",
+            user_id, catalog_id
         )
 
 async def db_clear_wishlist(pool, user_id):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM wishlists WHERE user_id = $1", user_id)
-
-async def db_save_catalog(pool, items):
-    async with pool.acquire() as conn:
-        for item in items:
-            await conn.execute("""
-                INSERT INTO catalog (url, name, display, photo_url)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (url) DO UPDATE SET name=$2, display=$3, photo_url=$4
-            """, item["url"], item["name"], item.get("display") or item["name"], item.get("photo_url"))
-
-async def db_get_catalog_item(pool, url):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM catalog WHERE url = $1", url)
-    return dict(row) if row else {}
 
 # ─────────────────────────────────────────────
 # Вспомогательные функции
@@ -137,8 +138,9 @@ async def send_msg(update, context, text, reply_markup=None, disable_web_page_pr
     return msg
 
 def make_buttons(links):
+    # Используем короткий ID из базы вместо url — нет ограничения на длину ссылки
     buttons = [
-        InlineKeyboardButton(f"❤️ {item['name'].split()[0]}", callback_data=f"save_{item['url']}")
+        InlineKeyboardButton(f"❤️ {item['name'].split()[0]}", callback_data=f"save_{item['db_id']}")
         for item in links
     ]
     rows = []
@@ -186,6 +188,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   название | url | текст для вишлиста\n"
             "   или с картинкой:\n"
             "   название | url | текст для вишлиста | url картинки\n\n"
+            "   Ссылка может быть любой длины!\n\n"
             "3. Отправь текст поста — ссылки добавятся снизу автоматически\n"
             "4. Напиши /publish\n\n"
             "❤️ Вишлист:\n"
@@ -216,6 +219,7 @@ async def new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   название | url | текст для вишлиста\n"
         "   или с картинкой:\n"
         "   название | url | текст для вишлиста | url картинки\n\n"
+        "   Ссылка может быть любой длины!\n\n"
         "3. Текст поста — ссылки добавятся снизу автоматически\n"
         "4. /publish",
         disable_web_page_preview=True
@@ -235,7 +239,14 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pool = context.application.bot_data["db"]
-    await db_save_catalog(pool, draft["links"])
+
+    # Сохраняем ссылки в базу и получаем их ID
+    for item in draft["links"]:
+        db_id = await db_save_catalog_item(
+            pool, item["url"], item["name"],
+            item.get("display"), item.get("photo_url")
+        )
+        item["db_id"] = db_id
 
     keyboard = make_buttons(draft["links"]) if draft["links"] else None
 
@@ -290,15 +301,6 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 display = parts[2] if len(parts) >= 3 else None
                 photo_url = parts[3] if len(parts) >= 4 else None
 
-                cb = f"save_{url}"
-                if len(cb) > 64:
-                    await send_msg(update, context,
-                        f"⚠️ Ссылка слишком длинная ({len(url)} симв.), максимум 57.\n"
-                        "Сократи ссылку и отправь снова.",
-                        disable_web_page_preview=True
-                    )
-                    return
-
                 draft["links"].append({"name": name, "url": url, "display": display, "photo_url": photo_url})
                 await send_msg(update, context, f"Ссылка добавлена ✅\n\n{draft_status()}", disable_web_page_preview=True)
                 return
@@ -323,7 +325,7 @@ async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for item in saved:
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Удалить из вишлиста", callback_data=f"del_{item['url']}")
+            InlineKeyboardButton("❌ Удалить из вишлиста", callback_data=f"del_{item['id']}")
         ]])
         display = item.get("display") or item.get("name") or ""
         photo_url = item.get("photo_url")
@@ -371,24 +373,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool = context.application.bot_data["db"]
 
     if data.startswith("save_"):
-        url = data[len("save_"):]
-        catalog_item = await db_get_catalog_item(pool, url)
-        display = catalog_item.get("display", "")
-        name = catalog_item.get("name", "")
-        photo_url = catalog_item.get("photo_url")
-
+        catalog_id = int(data[len("save_"):])
         saved = await db_get_wishlist(pool, user_id)
-        already = any(item["url"] == url for item in saved)
+        already = any(item["id"] == catalog_id for item in saved)
 
         if not already:
-            await db_add_to_wishlist(pool, user_id, url, name, display, photo_url)
+            await db_add_to_wishlist(pool, user_id, catalog_id)
             await query.answer(text="❤️ Сохранено в вишлист!", show_alert=False)
         else:
             await query.answer(text="Уже в вишлисте!", show_alert=False)
 
     elif data.startswith("del_"):
-        url = data[len("del_"):]
-        await db_remove_from_wishlist(pool, user_id, url)
+        catalog_id = int(data[len("del_"):])
+        await db_remove_from_wishlist(pool, user_id, catalog_id)
         await query.answer(text="Удалено из вишлиста ✅", show_alert=False)
         try:
             await query.message.delete()
@@ -420,3 +417,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
