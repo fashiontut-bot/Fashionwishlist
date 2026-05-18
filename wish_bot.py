@@ -2,14 +2,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
 import os
-import asyncpg
+import aiosqlite
 
 # ─────────────────────────────────────────────
 # НАСТРОЙКИ
 # ─────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DB_PATH = "bot_database.db"
 
 CHANNEL_USERNAME = '@rublefashion'
 ADMIN_ID = 153113117
@@ -33,74 +33,81 @@ user_messages = {}
 # ─────────────────────────────────────────────
 
 async def init_db(app):
-    app.bot_data["db"] = await asyncpg.create_pool(DATABASE_URL)
-    pool = app.bot_data["db"]
-    async with pool.acquire() as conn:
-        await conn.execute("""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS catalog (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT UNIQUE,
                 name TEXT,
                 display TEXT,
                 photo_url TEXT
             )
         """)
-        await conn.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS wishlists (
-                user_id BIGINT,
+                user_id INTEGER,
                 catalog_id INTEGER REFERENCES catalog(id),
-                created_at TIMESTAMP DEFAULT NOW(),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, catalog_id)
             )
         """)
+        await db.commit()
 
 async def close_db(app):
-    await app.bot_data["db"].close()
+    pass  # aiosqlite открывает/закрывает соединение автоматически
 
-async def db_save_catalog_item(pool, url, name, display, photo_url):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+async def db_save_catalog_item(url, name, display, photo_url):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
             INSERT INTO catalog (url, name, display, photo_url)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (url) DO UPDATE SET name=$2, display=$3, photo_url=$4
-            RETURNING id
-        """, url, name, display or name, photo_url)
-    return row["id"]
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET name=excluded.name, display=excluded.display, photo_url=excluded.photo_url
+        """, (url, name, display or name, photo_url))
+        await db.commit()
+        async with db.execute("SELECT id FROM catalog WHERE url = ?", (url,)) as cursor:
+            row = await cursor.fetchone()
+    return row[0]
 
-async def db_get_catalog_item_by_id(pool, item_id):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM catalog WHERE id = $1", item_id)
+async def db_get_catalog_item_by_id(item_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM catalog WHERE id = ?", (item_id,)) as cursor:
+            row = await cursor.fetchone()
     return dict(row) if row else {}
 
-async def db_get_wishlist(pool, user_id):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+async def db_get_wishlist(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
             SELECT c.id, c.url, c.name, c.display, c.photo_url
             FROM wishlists w
             JOIN catalog c ON w.catalog_id = c.id
-            WHERE w.user_id = $1
+            WHERE w.user_id = ?
             ORDER BY w.created_at
-        """, user_id)
+        """, (user_id,)) as cursor:
+            rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
-async def db_add_to_wishlist(pool, user_id, catalog_id):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO wishlists (user_id, catalog_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-        """, user_id, catalog_id)
+async def db_add_to_wishlist(user_id, catalog_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO wishlists (user_id, catalog_id)
+            VALUES (?, ?)
+        """, (user_id, catalog_id))
+        await db.commit()
 
-async def db_remove_from_wishlist(pool, user_id, catalog_id):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM wishlists WHERE user_id = $1 AND catalog_id = $2",
-            user_id, catalog_id
+async def db_remove_from_wishlist(user_id, catalog_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM wishlists WHERE user_id = ? AND catalog_id = ?",
+            (user_id, catalog_id)
         )
+        await db.commit()
 
-async def db_clear_wishlist(pool, user_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM wishlists WHERE user_id = $1", user_id)
+async def db_clear_wishlist(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM wishlists WHERE user_id = ?", (user_id,))
+        await db.commit()
 
 # ─────────────────────────────────────────────
 # Вспомогательные функции
@@ -138,7 +145,6 @@ async def send_msg(update, context, text, reply_markup=None, disable_web_page_pr
     return msg
 
 def make_buttons(links):
-    # Используем короткий ID из базы вместо url — нет ограничения на длину ссылки
     buttons = [
         InlineKeyboardButton(f"❤️ {item['name'].split()[0]}", callback_data=f"save_{item['db_id']}")
         for item in links
@@ -188,7 +194,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "   название | url | текст для вишлиста\n"
             "   или с картинкой:\n"
             "   название | url | текст для вишлиста | url картинки\n\n"
-            "   Ссылка может быть любой длины!\n\n"
             "3. Отправь текст поста — ссылки добавятся снизу автоматически\n"
             "4. Напиши /publish\n\n"
             "❤️ Вишлист:\n"
@@ -219,7 +224,6 @@ async def new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   название | url | текст для вишлиста\n"
         "   или с картинкой:\n"
         "   название | url | текст для вишлиста | url картинки\n\n"
-        "   Ссылка может быть любой длины!\n\n"
         "3. Текст поста — ссылки добавятся снизу автоматически\n"
         "4. /publish",
         disable_web_page_preview=True
@@ -238,12 +242,9 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_msg(update, context, "❌ Нет ни текста, ни фото. Добавь хотя бы что-то одно.")
         return
 
-    pool = context.application.bot_data["db"]
-
-    # Сохраняем ссылки в базу и получаем их ID
     for item in draft["links"]:
         db_id = await db_save_catalog_item(
-            pool, item["url"], item["name"],
+            item["url"], item["name"],
             item.get("display"), item.get("photo_url")
         )
         item["db_id"] = db_id
@@ -314,8 +315,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    pool = context.application.bot_data["db"]
-    saved = await db_get_wishlist(pool, user_id)
+    saved = await db_get_wishlist(user_id)
 
     await delete_user_messages(user_id, context)
 
@@ -352,8 +352,7 @@ async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    pool = context.application.bot_data["db"]
-    await db_clear_wishlist(pool, user_id)
+    await db_clear_wishlist(user_id)
     await delete_user_messages(user_id, context)
     await send_msg(update, context, "Вишлист очищен ✅")
 
@@ -370,22 +369,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
-    pool = context.application.bot_data["db"]
 
     if data.startswith("save_"):
         catalog_id = int(data[len("save_"):])
-        saved = await db_get_wishlist(pool, user_id)
+        saved = await db_get_wishlist(user_id)
         already = any(item["id"] == catalog_id for item in saved)
 
         if not already:
-            await db_add_to_wishlist(pool, user_id, catalog_id)
+            await db_add_to_wishlist(user_id, catalog_id)
             await query.answer(text="❤️ Сохранено в вишлист!", show_alert=False)
         else:
             await query.answer(text="Уже в вишлисте!", show_alert=False)
 
     elif data.startswith("del_"):
         catalog_id = int(data[len("del_"):])
-        await db_remove_from_wishlist(pool, user_id, catalog_id)
+        await db_remove_from_wishlist(user_id, catalog_id)
         await query.answer(text="Удалено из вишлиста ✅", show_alert=False)
         try:
             await query.message.delete()
@@ -417,4 +415,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
