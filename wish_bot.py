@@ -2,14 +2,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
 import os
-import aiosqlite
+import asyncpg
 
 # ─────────────────────────────────────────────
 # НАСТРОЙКИ
 # ─────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DB_PATH = "bot_database.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 CHANNEL_USERNAME = '@rublefashion'
 ADMIN_ID = 153113117
@@ -33,81 +33,74 @@ user_messages = {}
 # ─────────────────────────────────────────────
 
 async def init_db(app):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    app.bot_data["db"] = await asyncpg.create_pool(DATABASE_URL)
+    pool = app.bot_data["db"]
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT UNIQUE,
                 name TEXT,
                 display TEXT,
                 photo_url TEXT
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS wishlists (
-                user_id INTEGER,
+                user_id BIGINT,
                 catalog_id INTEGER REFERENCES catalog(id),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
                 PRIMARY KEY (user_id, catalog_id)
             )
         """)
-        await db.commit()
 
 async def close_db(app):
-    pass  # aiosqlite открывает/закрывает соединение автоматически
+    await app.bot_data["db"].close()
 
-async def db_save_catalog_item(url, name, display, photo_url):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+async def db_save_catalog_item(pool, url, name, display, photo_url):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
             INSERT INTO catalog (url, name, display, photo_url)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET name=excluded.name, display=excluded.display, photo_url=excluded.photo_url
-        """, (url, name, display or name, photo_url))
-        await db.commit()
-        async with db.execute("SELECT id FROM catalog WHERE url = ?", (url,)) as cursor:
-            row = await cursor.fetchone()
-    return row[0]
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (url) DO UPDATE SET name=$2, display=$3, photo_url=$4
+            RETURNING id
+        """, url, name, display or name, photo_url)
+    return row["id"]
 
-async def db_get_catalog_item_by_id(item_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM catalog WHERE id = ?", (item_id,)) as cursor:
-            row = await cursor.fetchone()
+async def db_get_catalog_item_by_id(pool, item_id):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM catalog WHERE id = $1", item_id)
     return dict(row) if row else {}
 
-async def db_get_wishlist(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
+async def db_get_wishlist(pool, user_id):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
             SELECT c.id, c.url, c.name, c.display, c.photo_url
             FROM wishlists w
             JOIN catalog c ON w.catalog_id = c.id
-            WHERE w.user_id = ?
+            WHERE w.user_id = $1
             ORDER BY w.created_at
-        """, (user_id,)) as cursor:
-            rows = await cursor.fetchall()
+        """, user_id)
     return [dict(r) for r in rows]
 
-async def db_add_to_wishlist(user_id, catalog_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR IGNORE INTO wishlists (user_id, catalog_id)
-            VALUES (?, ?)
-        """, (user_id, catalog_id))
-        await db.commit()
+async def db_add_to_wishlist(pool, user_id, catalog_id):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO wishlists (user_id, catalog_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """, user_id, catalog_id)
 
-async def db_remove_from_wishlist(user_id, catalog_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM wishlists WHERE user_id = ? AND catalog_id = ?",
-            (user_id, catalog_id)
+async def db_remove_from_wishlist(pool, user_id, catalog_id):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM wishlists WHERE user_id = $1 AND catalog_id = $2",
+            user_id, catalog_id
         )
-        await db.commit()
 
-async def db_clear_wishlist(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM wishlists WHERE user_id = ?", (user_id,))
-        await db.commit()
+async def db_clear_wishlist(pool, user_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM wishlists WHERE user_id = $1", user_id)
 
 # ─────────────────────────────────────────────
 # Вспомогательные функции
@@ -145,6 +138,7 @@ async def send_msg(update, context, text, reply_markup=None, disable_web_page_pr
     return msg
 
 def make_buttons(links):
+    # Используем короткий ID из базы вместо url — нет ограничения на длину ссылки
     buttons = [
         InlineKeyboardButton(f"❤️ {item['name'].split()[0]}", callback_data=f"save_{item['db_id']}")
         for item in links
@@ -159,7 +153,7 @@ def build_links_block(links):
     for item in links:
         display = item.get("display") or item["name"]
         lines.append(f"<a href='{item['url']}'>{display}</a>")
-    return "\n".join(lines)
+    return "\\n".join(lines)
 
 def draft_status():
     photo = "✅ фото загружено" if draft["photo_id"] else "❌ фото не загружено"
@@ -170,10 +164,10 @@ def draft_status():
             display = l.get("display") or l["name"]
             photo_icon = " 🖼" if l.get("photo_url") else ""
             lines.append(f"  {i+1}. {display}{photo_icon} — {l['url']}")
-        links = "✅ ссылки:\n" + "\n".join(lines)
+        links = "✅ ссылки:\\n" + "\\n".join(lines)
     else:
         links = "❌ ссылки не добавлены"
-    return f"{photo}\n{text}\n{links}"
+    return f"{photo}\\n{text}\\n{links}"
 
 # ─────────────────────────────────────────────
 # Команды
@@ -183,29 +177,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id == ADMIN_ID:
         text = (
-            "Привет!\n\n"
-            "📢 Создание поста:\n"
-            "/newpost — начать новый пост (сбросить черновик)\n"
-            "/status — посмотреть черновик\n"
-            "/publish — опубликовать пост в канал\n\n"
-            "Как создать пост:\n"
-            "1. Отправь фото\n"
-            "2. Добавь ссылки в формате:\n"
-            "   название | url | текст для вишлиста\n"
-            "   или с картинкой:\n"
-            "   название | url | текст для вишлиста | url картинки\n\n"
-            "3. Отправь текст поста — ссылки добавятся снизу автоматически\n"
-            "4. Напиши /publish\n\n"
-            "❤️ Вишлист:\n"
-            "/wishlist — показать сохранённые товары\n"
-            "/clearwishlist — очистить вишлист\n"
+            "Привет!\\n\\n"
+            "📢 Создание поста:\\n"
+            "/newpost — начать новый пост (сбросить черновик)\\n"
+            "/status — посмотреть черновик\\n"
+            "/publish — опубликовать пост в канал\\n\\n"
+            "Как создать пост:\\n"
+            "1. Отправь фото\\n"
+            "2. Добавь ссылки в формате:\\n"
+            "   название | url | текст для вишлиста\\n"
+            "   или с картинкой:\\n"
+            "   название | url | текст для вишлиста | url картинки\\n\\n"
+            "   Ссылка может быть любой длины!\\n\\n"
+            "3. Отправь текст поста — ссылки добавятся снизу автоматически\\n"
+            "4. Напиши /publish\\n\\n"
+            "❤️ Вишлист:\\n"
+            "/wishlist — показать сохранённые товары\\n"
+            "/clearwishlist — очистить вишлист\\n"
             "/clearscreen — удалить сообщения бота"
         )
     else:
         text = (
-            "Привет! Нажимай на ❤️ под товарами в канале — они сохранятся в твой вишлист.\n\n"
-            "/wishlist — показать сохранённые товары\n"
-            "/clearwishlist — очистить вишлист\n"
+            "Привет! Нажимай на ❤️ под товарами в канале — они сохранятся в твой вишлист.\\n\\n"
+            "/wishlist — показать сохранённые товары\\n"
+            "/clearwishlist — очистить вишлист\\n"
             "/clearscreen — удалить сообщения бота"
         )
     await send_msg(update, context, text, disable_web_page_preview=True)
@@ -217,14 +212,15 @@ async def new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft["text"] = None
     draft["links"] = []
     await send_msg(update, context,
-        "Черновик сброшен ✅\n\n"
-        "Отправь мне:\n"
-        "1. Фото\n"
-        "2. Ссылки в формате:\n"
-        "   название | url | текст для вишлиста\n"
-        "   или с картинкой:\n"
-        "   название | url | текст для вишлиста | url картинки\n\n"
-        "3. Текст поста — ссылки добавятся снизу автоматически\n"
+        "Черновик сброшен ✅\\n\\n"
+        "Отправь мне:\\n"
+        "1. Фото\\n"
+        "2. Ссылки в формате:\\n"
+        "   название | url | текст для вишлиста\\n"
+        "   или с картинкой:\\n"
+        "   название | url | текст для вишлиста | url картинки\\n\\n"
+        "   Ссылка может быть любой длины!\\n\\n"
+        "3. Текст поста — ссылки добавятся снизу автоматически\\n"
         "4. /publish",
         disable_web_page_preview=True
     )
@@ -232,7 +228,7 @@ async def new_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-    await send_msg(update, context, f"Текущий черновик:\n\n{draft_status()}", disable_web_page_preview=True)
+    await send_msg(update, context, f"Текущий черновик:\\n\\n{draft_status()}", disable_web_page_preview=True)
 
 async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
@@ -242,9 +238,12 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_msg(update, context, "❌ Нет ни текста, ни фото. Добавь хотя бы что-то одно.")
         return
 
+    pool = context.application.bot_data["db"]
+
+    # Сохраняем ссылки в базу и получаем их ID
     for item in draft["links"]:
         db_id = await db_save_catalog_item(
-            item["url"], item["name"],
+            pool, item["url"], item["name"],
             item.get("display"), item.get("photo_url")
         )
         item["db_id"] = db_id
@@ -253,7 +252,7 @@ async def publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     base_text = draft["text"] or ""
     links_block = build_links_block(draft["links"]) if draft["links"] else ""
-    full_text = f"{base_text}\n\n{links_block}" if links_block else base_text
+    full_text = f"{base_text}\\n\\n{links_block}" if links_block else base_text
 
     try:
         if draft["photo_id"]:
@@ -288,7 +287,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if update.message.photo:
         draft["photo_id"] = update.message.photo[-1].file_id
-        await send_msg(update, context, f"Фото сохранено ✅\n\n{draft_status()}", disable_web_page_preview=True)
+        await send_msg(update, context, f"Фото сохранено ✅\\n\\n{draft_status()}", disable_web_page_preview=True)
         return
 
     if update.message.text:
@@ -303,11 +302,11 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 photo_url = parts[3] if len(parts) >= 4 else None
 
                 draft["links"].append({"name": name, "url": url, "display": display, "photo_url": photo_url})
-                await send_msg(update, context, f"Ссылка добавлена ✅\n\n{draft_status()}", disable_web_page_preview=True)
+                await send_msg(update, context, f"Ссылка добавлена ✅\\n\\n{draft_status()}", disable_web_page_preview=True)
                 return
 
         draft["text"] = text
-        await send_msg(update, context, f"Текст сохранён ✅\n\n{draft_status()}", disable_web_page_preview=True)
+        await send_msg(update, context, f"Текст сохранён ✅\\n\\n{draft_status()}", disable_web_page_preview=True)
 
 # ─────────────────────────────────────────────
 # Вишлист
@@ -315,7 +314,8 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    saved = await db_get_wishlist(user_id)
+    pool = context.application.bot_data["db"]
+    saved = await db_get_wishlist(pool, user_id)
 
     await delete_user_messages(user_id, context)
 
@@ -331,7 +331,7 @@ async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_url = item.get("photo_url")
 
         if photo_url:
-            caption = f"<b>{display}</b>\n{item['url']}" if display else item["url"]
+            caption = f"<b>{display}</b>\\n{item['url']}" if display else item["url"]
             try:
                 msg = await update.message.reply_photo(
                     photo=photo_url,
@@ -342,17 +342,18 @@ async def wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await record_bot_message(user_id, update.effective_chat.id, msg.message_id)
             except:
-                text = f"<b>{display}</b>\n{item['url']}" if display else item["url"]
+                text = f"<b>{display}</b>\\n{item['url']}" if display else item["url"]
                 await send_msg(update, context, text, reply_markup=keyboard, parse_mode='HTML')
         else:
-            text = f"<b>{display}</b>\n{item['url']}" if display else item["url"]
+            text = f"<b>{display}</b>\\n{item['url']}" if display else item["url"]
             await send_msg(update, context, text, reply_markup=keyboard, parse_mode='HTML')
 
     await send_msg(update, context, f"Товаров в вишлисте: {len(saved)}", disable_web_page_preview=True)
 
 async def clear_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    await db_clear_wishlist(user_id)
+    pool = context.application.bot_data["db"]
+    await db_clear_wishlist(pool, user_id)
     await delete_user_messages(user_id, context)
     await send_msg(update, context, "Вишлист очищен ✅")
 
@@ -369,21 +370,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
+    pool = context.application.bot_data["db"]
 
     if data.startswith("save_"):
         catalog_id = int(data[len("save_"):])
-        saved = await db_get_wishlist(user_id)
+        saved = await db_get_wishlist(pool, user_id)
         already = any(item["id"] == catalog_id for item in saved)
 
         if not already:
-            await db_add_to_wishlist(user_id, catalog_id)
+            await db_add_to_wishlist(pool, user_id, catalog_id)
             await query.answer(text="❤️ Сохранено в вишлист!", show_alert=False)
         else:
             await query.answer(text="Уже в вишлисте!", show_alert=False)
 
     elif data.startswith("del_"):
         catalog_id = int(data[len("del_"):])
-        await db_remove_from_wishlist(user_id, catalog_id)
+        await db_remove_from_wishlist(pool, user_id, catalog_id)
         await query.answer(text="Удалено из вишлиста ✅", show_alert=False)
         try:
             await query.message.delete()
